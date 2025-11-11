@@ -115,59 +115,70 @@ function VoiceInterface() {
   );
 
   return (
-    <div className="flex flex-col items-center justify-center space-y-6 p-8 min-h-screen">
+    <div className="flex flex-col items-center justify-center space-y-8 md:space-y-10 py-8 md:py-12">
       {/* Status Indicator */}
-      <div className="flex flex-col items-center space-y-4">
-        <div className={`
-          w-32 h-32 rounded-full flex items-center justify-center
-          ${getStatusColor()} transition-all duration-300 text-6xl
-          ${isListening ? 'animate-pulse' : ''}
-          shadow-lg
-        `}>
-          {getStatusEmoji()}
+      <div className="flex flex-col items-center space-y-5">
+        <div className="status-orb">
+          <div className="status-orb-ring" />
+          <div
+            className={`status-dot ${
+              agentState === 'speaking'
+                ? 'state-speaking'
+                : agentState === 'thinking'
+                ? 'state-thinking'
+                : agentState === 'listening'
+                ? 'state-listening'
+                : 'state-idle'
+            }`}
+          />
         </div>
-        
+
         <div className="text-center">
-          <h2 className="text-2xl font-bold text-gray-800">
+          <h2 className="text-2xl md:text-3xl font-semibold">
             {getStatusText()}
           </h2>
-          <p className="text-sm text-gray-500 mt-1">
-            {room.state} • {tracks.length} tracks
-          </p>
+          <div className="mt-2 flex items-center justify-center gap-2 text-xs md:text-sm subtle">
+            <span className="inline-flex items-center gap-1 rounded-full px-2 py-1 glass">
+              <span
+                className={`inline-block h-2 w-2 rounded-full ${
+                  room.state === 'connected'
+                    ? 'bg-green-500'
+                    : room.state === 'connecting'
+                    ? 'bg-yellow-500'
+                    : 'bg-red-500'
+                }`}
+              />
+              {room.state}
+            </span>
+            <span>•</span>
+            <span>{room.remoteParticipants.size + 1} participants</span>
+          </div>
         </div>
       </div>
-
-      {/* Audio Visualizer - Visual indicator */}
-      <div className="w-full max-w-md">
-        <div className="flex items-end justify-center space-x-2 h-24">
-          {[1, 2, 3, 4, 5].map((i) => (
-            <div
+      {/* Audio Visualizer - smooth waves */}
+      <div className="w-full max-w-xl">
+        <div className="wave mx-auto">
+          {Array.from({ length: 24 }).map((_, i) => (
+            <span
               key={i}
-              className={`w-3 bg-blue-500 rounded-full transition-all duration-500 ${
-                agentState === 'speaking'
-                  ? 'animate-pulse'
-                  : agentState === 'listening'
-                  ? 'opacity-70 animate-pulse-slow'
-                  : 'opacity-30'
-              }`}
               style={{
-                height: agentState === 'speaking' 
-                  ? `${20 + i * 8}px` 
-                  : agentState === 'listening'
-                  ? `${10 + i * 3}px`
-                  : '8px',
-                animationDelay: `${i * 0.15}s`,
-                minHeight: '8px',
+                left: `${i * 4.2}%`,
+                height:
+                  agentState === 'speaking'
+                    ? `${24 + (i % 6) * 10}px`
+                    : agentState === 'listening'
+                    ? `${12 + (i % 6) * 6}px`
+                    : '10px',
+                animationDelay: `${i * 60}ms`,
               }}
             />
           ))}
         </div>
       </div>
 
-      {/* Connection Info */}
-      <div className="text-xs text-gray-400 text-center">
-        <p>Room: {room.name}</p>
-        <p>Participants: {room.remoteParticipants.size + 1}</p>
+      {/* Connection Info - subtle */}
+      <div className="text-[11px] md:text-xs subtle text-center">
+        <p className="opacity-80">Room: {room.name}</p>
       </div>
     </div>
   );
