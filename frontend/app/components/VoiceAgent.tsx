@@ -446,10 +446,11 @@ export default function VoiceAgent() {
   // Cleanup effect: Reset refs and disconnect on page reload/unmount
   useEffect(() => {
     // Clear any stale connection flags from previous sessions on mount
+    // If a stale connection exists, it means the page was reloaded while connected
     if (typeof window !== 'undefined') {
       const staleConnection = sessionStorage.getItem(STORAGE_KEY);
       if (staleConnection) {
-        console.log('Clearing stale connection flag from previous session');
+        console.log('Detected page reload with active connection - clearing stale flags');
         sessionStorage.removeItem(STORAGE_KEY);
         globalConnectionActive = false;
       }
@@ -538,8 +539,11 @@ export default function VoiceAgent() {
       hasConnectedRef.current = false; // Reset connection tracking
 
       try {
+        // Generate unique participant name with timestamp + random component
+        // This ensures no conflicts even on very fast reloads
+        const uniqueId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
         const response = await fetch(
-          `/api/token?roomName=${roomName}&participantName=user-${Date.now()}`
+          `/api/token?roomName=${roomName}&participantName=user-${uniqueId}`
         );
 
         if (!response.ok) {
@@ -674,7 +678,8 @@ export default function VoiceAgent() {
 
   // Prevent duplicate LiveKitRoom renders if connection is already active
   // This handles React Strict Mode double-mounting in development
-  if (globalConnectionActive && !roomRef.current) {
+  // Check BEFORE setting the flag to handle the first render
+  if (globalConnectionActive) {
     console.log('Connection already active globally, preventing duplicate LiveKitRoom render');
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -684,6 +689,16 @@ export default function VoiceAgent() {
         </div>
       </div>
     );
+  }
+
+  // Set the flag NOW before rendering LiveKitRoom to prevent second render from Strict Mode
+  // This must happen before the component renders, not in onConnected
+  if (!globalConnectionActive && shouldConnect) {
+    console.log('Setting global connection flag before LiveKitRoom render');
+    globalConnectionActive = true;
+    if (typeof window !== 'undefined') {
+      sessionStorage.setItem(STORAGE_KEY, 'true');
+    }
   }
 
   // Use a stable key based on sessionId to prevent unnecessary remounts
@@ -704,12 +719,13 @@ export default function VoiceAgent() {
         reconnectPolicy: new DefaultReconnectPolicy(),
       }}
       onConnected={() => {
-        if (hasConnectedRef.current || globalConnectionActive) {
+        if (hasConnectedRef.current) {
           console.log('Already connected, skipping duplicate connection setup');
           return;
         }
         console.log('Connected to room');
         hasConnectedRef.current = true;
+        // globalConnectionActive is already set before render, just ensure it's set
         globalConnectionActive = true;
         if (typeof window !== 'undefined') {
           sessionStorage.setItem(STORAGE_KEY, 'true');

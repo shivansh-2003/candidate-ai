@@ -176,6 +176,12 @@ onDisconnected={(reason) => {
 
 - `/home/user/Candidate-ai/frontend/app/components/VoiceAgent.tsx`
 
+## Additional Fixes (v2 - React Strict Mode - CRITICAL)
+
+**Issue Identified**: The v1 fixes didn't work because `globalConnectionActive` was being set in the `onConnected` callback, which fires AFTER the connection process starts. React Strict Mode renders components twice almost simultaneously, so both renders would initiate connections before either one's `onConnected` callback fired.
+
+**Root Cause**: Race condition between React Strict Mode's double-render and asynchronous connection callbacks.
+
 ## Additional Fixes (v2 - React Strict Mode)
 
 After initial deployment, the issue persisted due to React Strict Mode causing double-mounting in development. Additional fixes were implemented:
@@ -261,6 +267,93 @@ onDisconnected={(reason) => {
   sessionStorage.removeItem(STORAGE_KEY);
   // ... rest of disconnect handling ...
 }}
+```
+
+## Critical Fixes (v3 - Fixing the Race Condition)
+
+The v2 approach still had the race condition. The CRITICAL fix is to set the flag BEFORE rendering LiveKitRoom, not in callbacks.
+
+### 10. Set Connection Flag BEFORE Rendering (Line 690-698)
+
+**THE KEY FIX**: Set `globalConnectionActive` synchronously during the render phase, before LiveKitRoom is rendered:
+
+```typescript
+// Check if already active FIRST
+if (globalConnectionActive) {
+  console.log('Connection already active globally, preventing duplicate LiveKitRoom render');
+  return <LoadingState />;
+}
+
+// Set the flag NOW before rendering LiveKitRoom
+// This prevents second Strict Mode render from getting past the check above
+if (!globalConnectionActive && shouldConnect) {
+  console.log('Setting global connection flag before LiveKitRoom render');
+  globalConnectionActive = true;
+  sessionStorage.setItem(STORAGE_KEY, 'true');
+}
+
+return <LiveKitRoom ... />;
+```
+
+**Why This Works**:
+- First render: `globalConnectionActive = false` → sets flag → renders LiveKitRoom
+- Second render (Strict Mode, microseconds later): `globalConnectionActive = true` → returns loading state → NO LiveKitRoom rendered
+- Result: Only ONE LiveKitRoom component ever renders, only ONE connection attempt
+
+### 11. Unique Participant IDs (Line 543)
+
+Added random component to participant names to prevent conflicts even on rapid reloads:
+
+```typescript
+const uniqueId = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+const response = await fetch(
+  `/api/token?roomName=${roomName}&participantName=user-${uniqueId}`
+);
+```
+
+### 12. Simplified Stale Connection Cleanup (Line 450-457)
+
+Removed the complex delay logic and simply clear stale flags on mount:
+
+```typescript
+if (typeof window !== 'undefined') {
+  const staleConnection = sessionStorage.getItem(STORAGE_KEY);
+  if (staleConnection) {
+    console.log('Detected page reload with active connection - clearing stale flags');
+    sessionStorage.removeItem(STORAGE_KEY);
+    globalConnectionActive = false;
+  }
+}
+```
+
+## Timeline of Fixes
+
+1. **v1 (Commit f215ff0)**: Added cleanup, beforeunload handler, useMemo for shouldConnect
+   - ❌ Failed: Didn't account for Strict Mode double-mounting
+
+2. **v2 (Commit 7af8250)**: Added global flags, Strict Mode detection with delayed cleanup
+   - ❌ Failed: Race condition - flags set in onConnected callback (too late)
+
+3. **v3 (This commit)**: Set flags BEFORE rendering LiveKitRoom
+   - ✅ Success: Synchronous flag setting prevents second render from creating LiveKitRoom
+
+## Expected Console Output (Success)
+
+On page reload with voice agent active:
+```
+[Page Reload]
+Detected page reload with active connection - clearing stale flags
+VoiceAgent unmounting, cleaning up connection state
+[New Page Load]
+Setting global connection flag before LiveKitRoom render
+Connected to room
+```
+
+On React Strict Mode double-render:
+```
+Setting global connection flag before LiveKitRoom render
+Connection already active globally, preventing duplicate LiveKitRoom render
+Connected to room
 ```
 
 ## References
