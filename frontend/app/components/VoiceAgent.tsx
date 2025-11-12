@@ -9,13 +9,63 @@ import {
   useLocalParticipant,
   useRemoteParticipants,
 } from '@livekit/components-react';
-import { Track, RemoteParticipant, Participant, RoomEvent, DisconnectReason } from 'livekit-client';
+import {
+  Track,
+  RemoteParticipant,
+  Participant,
+  Room,
+  RoomEvent,
+  DisconnectReason,
+  DefaultReconnectPolicy,
+} from 'livekit-client';
 import '@livekit/components-styles';
 import RadialVisualizer from '../components/RadialVisualizer';
 import { useAudioAnalyzer } from './hooks/useAudioAnalyzer';
 
+type ConnectionState = 'idle' | 'connecting' | 'waiting-agent' | 'connected' | 'reconnecting';
+const AGENT_TIMEOUT_MS = 12000;
+
+function waitForAgentParticipant(room: Room, timeout = AGENT_TIMEOUT_MS) {
+  return new Promise<RemoteParticipant>((resolve, reject) => {
+    const existing = Array.from(room.remoteParticipants.values())[0];
+    if (existing) {
+      resolve(existing);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('Agent connection timeout'));
+    }, timeout);
+
+    const handler = (participant: RemoteParticipant) => {
+      cleanup();
+      resolve(participant);
+    };
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      room.off(RoomEvent.ParticipantConnected, handler);
+    };
+
+    room.on(RoomEvent.ParticipantConnected, handler);
+  });
+}
+
 // Inner component - must be inside LiveKitRoom
-function VoiceInterface() {
+function VoiceInterface({
+  connectionState,
+  connectionStatus,
+  setConnectionState,
+  setConnectionStatus,
+  setAgentReady,
+}: {
+  connectionState: ConnectionState;
+  connectionStatus: string;
+  setConnectionState: (state: ConnectionState) => void;
+  setConnectionStatus: (note: string) => void;
+  setAgentReady: (ready: boolean) => void;
+}) {
   const room = useRoomContext();
   const localParticipant = useLocalParticipant();
   const remoteParticipants = useRemoteParticipants();
@@ -24,6 +74,7 @@ function VoiceInterface() {
   const [agentState, setAgentState] = useState<'idle' | 'listening' | 'thinking' | 'speaking'>('idle');
   const [isListening, setIsListening] = useState(false);
   const agentParticipantRef = useRef<RemoteParticipant | null>(null);
+  const micEnabledRef = useRef(false);
 
   // Find the agent participant (usually the first remote participant)
   useEffect(() => {
@@ -32,6 +83,38 @@ function VoiceInterface() {
       agentParticipantRef.current = agentParticipant;
     }
   }, [remoteParticipants]);
+
+  // Monitor room-level connection events for UI feedback
+  useEffect(() => {
+    if (!room) return;
+
+    const handleReconnecting = () => {
+      setConnectionState('reconnecting');
+      setConnectionStatus('Connection lost. Reconnecting…');
+    };
+    const handleReconnected = () => {
+      setConnectionState('waiting-agent');
+      setConnectionStatus('Reconnected. Waiting for agent…');
+      micEnabledRef.current = false;
+      setAgentReady(false);
+    };
+    const handleDisconnected = () => {
+      setConnectionState('connecting');
+      setConnectionStatus('Disconnected. Attempting new session…');
+      micEnabledRef.current = false;
+      setAgentReady(false);
+    };
+
+    room.on(RoomEvent.Reconnecting, handleReconnecting);
+    room.on(RoomEvent.Reconnected, handleReconnected);
+    room.on(RoomEvent.Disconnected, handleDisconnected);
+
+    return () => {
+      room.off(RoomEvent.Reconnecting, handleReconnecting);
+      room.off(RoomEvent.Reconnected, handleReconnected);
+      room.off(RoomEvent.Disconnected, handleDisconnected);
+    };
+  }, [room, setAgentReady, setConnectionState, setConnectionStatus]);
 
   // Track agent connection and audio state
   useEffect(() => {
@@ -62,8 +145,49 @@ function VoiceInterface() {
     setIsListening(true);
   }, [remoteParticipants, tracks]);
 
+  // Enable microphone only once agent is present (with user interaction for AudioContext)
+  useEffect(() => {
+    if (!room || connectionState !== 'waiting-agent') return;
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        const agent = await waitForAgentParticipant(room);
+        if (cancelled) return;
+        setConnectionState('connected');
+        setConnectionStatus('Connected');
+        if (!micEnabledRef.current) {
+          // Resume AudioContext if suspended (required for autoplay policy)
+          try {
+            const audioContext = (room as any).audioContext;
+            if (audioContext && audioContext.state === 'suspended') {
+              await audioContext.resume();
+            }
+          } catch (e) {
+            console.warn('Could not resume AudioContext:', e);
+          }
+          await room.localParticipant.setMicrophoneEnabled(true);
+          micEnabledRef.current = true;
+        }
+        setAgentReady(true);
+      } catch (err) {
+        if (!cancelled) {
+          setConnectionStatus((err as Error).message ?? 'Agent unavailable');
+        }
+      }
+    };
+
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionState, room, setAgentReady, setConnectionState, setConnectionStatus]);
+
   // Listen for data messages from agent (if agent sends state updates)
   useEffect(() => {
+    if (!room) return;
+
     const handleDataReceived = (payload: Uint8Array, participant?: Participant) => {
       if (participant && participant !== localParticipant.localParticipant) {
         try {
@@ -84,16 +208,7 @@ function VoiceInterface() {
     };
   }, [room, localParticipant]);
 
-  const getStatusEmoji = () => {
-    switch (agentState) {
-      case 'listening': return '🎤';
-      case 'thinking': return '🤔';
-      case 'speaking': return '🗣️';
-      default: return '💤';
-    }
-  };
-
-  const getStatusText = () => {
+  const getAgentStatusText = () => {
     switch (agentState) {
       case 'listening': return 'Listening to you...';
       case 'thinking': return 'Processing...';
@@ -102,14 +217,18 @@ function VoiceInterface() {
     }
   };
 
-  const getStatusColor = () => {
-    switch (agentState) {
-      case 'listening': return 'bg-green-500';
-      case 'thinking': return 'bg-yellow-500';
-      case 'speaking': return 'bg-blue-500';
-      default: return 'bg-gray-500';
+  const statusLabel = useMemo(() => {
+    switch (connectionState) {
+      case 'connecting':
+        return 'Connecting to voice agent...';
+      case 'reconnecting':
+        return 'Reconnecting...';
+      case 'waiting-agent':
+        return 'Waiting for agent...';
+      default:
+        return getAgentStatusText();
     }
-  };
+  }, [connectionState, agentState]);
 
   // Find agent audio MediaStreamTrack (first remote mic track)
   const agentMicTrack = useMemo(() => {
@@ -185,28 +304,31 @@ function VoiceInterface() {
 
         <div className="text-center">
           <h2 className="text-2xl md:text-3xl font-bold text-white drop-shadow-[0_6px_30px_rgba(56,189,248,0.45)] tracking-wide">
-            {getStatusText()}
+            {statusLabel}
           </h2>
           <div className="mt-3 flex items-center justify-center gap-3 text-xs md:text-sm text-white/85 font-medium">
             <span className="inline-flex items-center gap-1 rounded-full px-3 py-1.5 bg-emerald-500/15 border border-emerald-400/50 text-emerald-100 shadow-[0_8px_26px_-18px_rgba(34,197,94,0.9)]">
               <span
                 className={`inline-block h-2 w-2 rounded-full ${
-                  room.state === 'connected'
+                  room?.state === 'connected'
                     ? 'bg-green-500'
-                    : room.state === 'connecting'
+                    : room?.state === 'connecting'
                     ? 'bg-yellow-500'
                     : 'bg-red-500'
                 }`}
               />
-              {room.state}
+              {room?.state || 'unknown'}
             </span>
             <span className="text-white/60">•</span>
             <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 bg-sky-500/10 border border-sky-400/50 text-sky-100 shadow-[0_8px_26px_-18px_rgba(14,165,233,0.9)]">
               <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 19a3 3 0 0 0-6 0m9-7a4.5 4.5 0 0 0-9 0v.75a2.25 2.25 0 0 1-1.125 1.943l-.9.514A2.25 2.25 0 0 0 6 16.152V17.25A2.25 2.25 0 0 0 8.25 19.5h7.5A2.25 2.25 0 0 0 18 17.25v-1.098a2.25 2.25 0 0 0-1.125-1.943l-.9-.514A2.25 2.25 0 0 1 15 11.75V11.5Z" />
               </svg>
-              {room.remoteParticipants.size + 1} participants
+              {(room?.remoteParticipants?.size ?? 0) + 1} participants
             </span>
+          </div>
+          <div className="mt-2 text-[11px] md:text-xs text-white/70">
+            {connectionStatus}
           </div>
         </div>
       </div>
@@ -221,7 +343,7 @@ function VoiceInterface() {
 
       {/* Connection Info - subtle */}
       <div className="text-[11px] md:text-xs text-white/65 text-center">
-        <p>Room: <span className="font-semibold text-white/80">{room.name}</span></p>
+        <p>Room: <span className="font-semibold text-white/80">{room?.name || 'connecting...'}</span></p>
       </div>
 
       {/* Guide Sections */}
@@ -259,44 +381,139 @@ function VoiceInterface() {
 // Main component
 export default function VoiceAgent() {
   const [token, setToken] = useState<string>('');
+  const [sessionId, setSessionId] = useState<number>(() => Date.now());
   const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string>('');
   const [roomName] = useState('voice-agent-room');
+  const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
+  const [connectionStatus, setConnectionStatus] = useState('Click to start voice session');
+  const [, setAgentReady] = useState(false);
+  const [userInteracted, setUserInteracted] = useState(false);
+  const hasConnectedRef = useRef(false);
+  const isConnectingRef = useRef(false);
+  const connectionAttemptedRef = useRef(false);
+  const connectInitiatedRef = useRef(false);
 
-  const fetchToken = useCallback(async () => {
-    setIsConnecting(true);
-    setError('');
-    
-    try {
-      const response = await fetch(
-        `/api/token?roomName=${roomName}&participantName=user-${Date.now()}`
-      );
-      
-      if (!response.ok) {
-        throw new Error(`Token fetch failed: ${response.status}`);
-      }
-      
-      const data = await response.json();
-      
-      if (!data.token) {
-        throw new Error('No token received');
-      }
-      
-      setToken(data.token);
-      console.log('Token received successfully');
-      
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-      console.error('Token fetch error:', errorMessage);
-      setError(errorMessage);
-    } finally {
-      setIsConnecting(false);
+  // Calculate shouldConnect before any conditional returns (Rules of Hooks)
+  // Based on LiveKit docs: once connect={true}, keep it true to maintain connection
+  // LiveKitRoom handles connection state internally and won't reconnect if already connected
+  let shouldConnect = false;
+  if (connectInitiatedRef.current) {
+    // Once we've initiated connection, keep connect=true to maintain it
+    // LiveKitRoom will handle "already connected" internally
+    shouldConnect = true;
+  } else {
+    // Only initiate connection when we're actively trying to connect
+    const needsConnection = connectionState === 'connecting' || 
+                            connectionState === 'waiting-agent' || 
+                            connectionState === 'reconnecting';
+    if (needsConnection) {
+      connectInitiatedRef.current = true; // Mark that we've initiated connection
+      shouldConnect = true;
     }
-  }, [roomName]);
+  }
 
-  useEffect(() => {
-    fetchToken();
-  }, [fetchToken]);
+  const connectWithRetry = useCallback(
+    async (attempt = 1) => {
+      // Prevent multiple simultaneous connection attempts
+      if (isConnectingRef.current) {
+        console.log('Connection already in progress, skipping...');
+        return;
+      }
+
+      const maxRetries = 3;
+      const baseDelay = 1000;
+      isConnectingRef.current = true;
+      setConnectionState('connecting');
+      setConnectionStatus('Requesting access token…');
+      setIsConnecting(true);
+      setError('');
+      setAgentReady(false);
+      hasConnectedRef.current = false; // Reset connection tracking
+
+      try {
+        const response = await fetch(
+          `/api/token?roomName=${roomName}&participantName=user-${Date.now()}`
+        );
+
+        if (!response.ok) {
+          throw new Error(`Token fetch failed: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (!data.token) {
+          throw new Error('No token received');
+        }
+
+        setToken(data.token);
+        // Only update sessionId if we don't have one yet (prevents unnecessary remounts)
+        if (!sessionId || sessionId === 0) {
+          setSessionId(Date.now());
+        }
+        setConnectionStatus('Token acquired. Connecting to room…');
+        setIsConnecting(false);
+        connectionAttemptedRef.current = true;
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+        console.error('Token fetch error:', errorMessage);
+
+        if (attempt < maxRetries) {
+          const delay = baseDelay * Math.pow(2, attempt - 1);
+          setConnectionStatus(`Connection failed (${errorMessage}). Retrying in ${Math.round(delay / 1000)}s…`);
+          isConnectingRef.current = false; // Reset before retry
+          setTimeout(() => connectWithRetry(attempt + 1), delay);
+        } else {
+          setError(errorMessage);
+          setIsConnecting(false);
+          isConnectingRef.current = false;
+          setConnectionStatus('Unable to connect. Please retry.');
+        }
+      }
+    },
+    [roomName]
+  );
+
+  // Start session on user interaction (required for AudioContext autoplay policy)
+  const handleStartSession = useCallback(async () => {
+    // Prevent multiple clicks from triggering multiple connections
+    if (userInteracted || isConnectingRef.current || hasConnectedRef.current) {
+      console.log('Session already started or connection in progress');
+      return;
+    }
+
+    setUserInteracted(true);
+    // Resume any suspended AudioContext (required for autoplay policy)
+    try {
+      const contexts = (window as any).__livekitAudioContexts || [];
+      for (const ctx of contexts) {
+        if (ctx && ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+      }
+    } catch (e) {
+      console.warn('Could not resume AudioContext:', e);
+    }
+    connectWithRetry();
+  }, [userInteracted, connectWithRetry]);
+
+  // Idle state - show start button
+  if (connectionState === 'idle' && !userInteracted) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-center space-y-6">
+          <h2 className="text-3xl font-bold text-white mb-2">Ready to Start</h2>
+          <p className="text-white/70 mb-6">Click the button below to begin your voice session</p>
+          <button
+            onClick={handleStartSession}
+            className="px-8 py-4 bg-gradient-to-r from-blue-600 to-cyan-500 text-white font-semibold rounded-full hover:from-blue-700 hover:to-cyan-600 transition-all shadow-lg hover:shadow-xl transform hover:scale-105"
+          >
+            Start Voice Session
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // Loading state
   if (isConnecting || !token) {
@@ -304,7 +521,7 @@ export default function VoiceAgent() {
       <div className="flex items-center justify-center min-h-screen">
         <div className="text-center space-y-4">
           <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-blue-500 mx-auto"></div>
-          <p className="text-gray-600">Connecting to voice agent...</p>
+          <p className="text-white">{connectionStatus}</p>
         </div>
       </div>
     );
@@ -318,7 +535,7 @@ export default function VoiceAgent() {
           <h3 className="text-red-800 font-semibold mb-2">Connection Error</h3>
           <p className="text-red-600 text-sm mb-4">{error}</p>
           <button
-            onClick={fetchToken}
+            onClick={() => connectWithRetry()}
             className="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700 transition"
           >
             Retry Connection
@@ -343,30 +560,69 @@ export default function VoiceAgent() {
     );
   }
 
+  // Only render LiveKitRoom when we have a token and are ready to connect
+  // Also ensure we only render once per session to prevent duplicate connections
+  if (!token || connectionState === 'idle') {
+    return null;
+  }
+
+  // Use a stable key based on sessionId to prevent unnecessary remounts
+  // Only change key when we explicitly want a fresh connection
+  const roomKey = `room-${sessionId}`;
+
   return (
     <LiveKitRoom
+      key={roomKey}
       token={token}
       serverUrl={serverUrl}
-      connect={true}
-      audio={true}
+      connect={shouldConnect}
+      audio={false}
       video={false}
+      options={{
+        adaptiveStream: true,
+        dynacast: true,
+        reconnectPolicy: new DefaultReconnectPolicy(),
+      }}
       onConnected={() => {
+        if (hasConnectedRef.current) {
+          console.log('Already connected, skipping duplicate connection');
+          return;
+        }
         console.log('Connected to room');
+        hasConnectedRef.current = true;
+        setConnectionState('waiting-agent');
+        setConnectionStatus('Connected to room. Waiting for agent…');
       }}
       onDisconnected={(reason) => {
         console.log('Disconnected:', reason);
+        hasConnectedRef.current = false; // Reset connection tracking
+        isConnectingRef.current = false; // Reset connecting flag
+        connectionAttemptedRef.current = false; // Reset connection attempt flag
+        connectInitiatedRef.current = false; // Reset so we can reconnect
         // Optional: Auto-reconnect (skip if user initiated disconnect)
-        if (reason !== DisconnectReason.CLIENT_INITIATED) {
-          setTimeout(fetchToken, 2000);
+        if (reason !== DisconnectReason.CLIENT_INITIATED && userInteracted) {
+          setConnectionState('connecting');
+          setConnectionStatus('Connection lost. Reconnecting…');
+          setTimeout(() => connectWithRetry(), 2000);
+        } else {
+          setConnectionState('idle');
+          setConnectionStatus('Disconnected. Click to reconnect');
         }
       }}
       onError={(error) => {
         console.error('Room error:', error);
         setError(error.message);
+        setConnectionStatus(`Room error: ${error.message}`);
       }}
       className="h-screen w-full"
     >
-      <VoiceInterface />
+      <VoiceInterface
+        connectionState={connectionState}
+        connectionStatus={connectionStatus}
+        setConnectionState={setConnectionState}
+        setConnectionStatus={setConnectionStatus}
+        setAgentReady={setAgentReady}
+      />
       <RoomAudioRenderer />
     </LiveKitRoom>
   );
