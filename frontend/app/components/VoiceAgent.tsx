@@ -59,22 +59,31 @@ function VoiceInterface({
   setConnectionState,
   setConnectionStatus,
   setAgentReady,
+  onRoomReady,
 }: {
   connectionState: ConnectionState;
   connectionStatus: string;
   setConnectionState: (state: ConnectionState) => void;
   setConnectionStatus: (note: string) => void;
   setAgentReady: (ready: boolean) => void;
+  onRoomReady?: (room: Room) => void;
 }) {
   const room = useRoomContext();
   const localParticipant = useLocalParticipant();
   const remoteParticipants = useRemoteParticipants();
   const tracks = useTracks([Track.Source.Microphone, Track.Source.Camera], { onlySubscribed: false });
-  
+
   const [agentState, setAgentState] = useState<'idle' | 'listening' | 'thinking' | 'speaking'>('idle');
   const [isListening, setIsListening] = useState(false);
   const agentParticipantRef = useRef<RemoteParticipant | null>(null);
   const micEnabledRef = useRef(false);
+
+  // Pass room reference to parent
+  useEffect(() => {
+    if (room && onRoomReady) {
+      onRoomReady(room);
+    }
+  }, [room, onRoomReady]);
 
   // Find the agent participant (usually the first remote participant)
   useEffect(() => {
@@ -113,6 +122,14 @@ function VoiceInterface({
       room.off(RoomEvent.Reconnecting, handleReconnecting);
       room.off(RoomEvent.Reconnected, handleReconnected);
       room.off(RoomEvent.Disconnected, handleDisconnected);
+
+      // Disconnect room on component unmount to prevent stale connections
+      if (room.state === 'connected' || room.state === 'connecting') {
+        console.log('Cleaning up room connection on unmount');
+        room.disconnect().catch((err) => {
+          console.warn('Error disconnecting room during cleanup:', err);
+        });
+      }
     };
   }, [room, setAgentReady, setConnectionState, setConnectionStatus]);
 
@@ -393,25 +410,85 @@ export default function VoiceAgent() {
   const isConnectingRef = useRef(false);
   const connectionAttemptedRef = useRef(false);
   const connectInitiatedRef = useRef(false);
+  const roomRef = useRef<Room | null>(null);
 
-  // Calculate shouldConnect before any conditional returns (Rules of Hooks)
+  // Stable shouldConnect value using useMemo to prevent unnecessary re-renders
   // Based on LiveKit docs: once connect={true}, keep it true to maintain connection
-  // LiveKitRoom handles connection state internally and won't reconnect if already connected
-  let shouldConnect = false;
-  if (connectInitiatedRef.current) {
-    // Once we've initiated connection, keep connect=true to maintain it
-    // LiveKitRoom will handle "already connected" internally
-    shouldConnect = true;
-  } else {
-    // Only initiate connection when we're actively trying to connect
-    const needsConnection = connectionState === 'connecting' || 
-                            connectionState === 'waiting-agent' || 
-                            connectionState === 'reconnecting';
-    if (needsConnection) {
-      connectInitiatedRef.current = true; // Mark that we've initiated connection
-      shouldConnect = true;
+  // Only connect when we have a token and user has interacted
+  const shouldConnect = useMemo(() => {
+    // Don't connect if no token or user hasn't started session
+    if (!token || !userInteracted) {
+      return false;
     }
-  }
+
+    // If already initiated, keep connection active
+    if (connectInitiatedRef.current) {
+      return true;
+    }
+
+    // Only initiate connection when in a connecting state
+    const needsConnection = connectionState === 'connecting' ||
+                            connectionState === 'waiting-agent' ||
+                            connectionState === 'reconnecting';
+
+    if (needsConnection) {
+      connectInitiatedRef.current = true;
+      return true;
+    }
+
+    return false;
+  }, [token, userInteracted, connectionState]);
+
+  // Cleanup effect: Reset refs and disconnect on page reload/unmount
+  useEffect(() => {
+    // Mark that component is mounted
+    const isMounted = { current: true };
+
+    // Handle page reload/close - ensure room is disconnected
+    const handleBeforeUnload = () => {
+      console.log('Page unloading, disconnecting room');
+      if (roomRef.current) {
+        const room = roomRef.current;
+        if (room.state === 'connected' || room.state === 'connecting') {
+          // Synchronous disconnect on beforeunload
+          try {
+            room.disconnect();
+          } catch (err) {
+            console.warn('Error disconnecting room during beforeunload:', err);
+          }
+        }
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    return () => {
+      // Component is unmounting
+      isMounted.current = false;
+      console.log('VoiceAgent unmounting, cleaning up connection state');
+
+      // Remove beforeunload listener
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+
+      // Reset all connection tracking refs
+      hasConnectedRef.current = false;
+      isConnectingRef.current = false;
+      connectionAttemptedRef.current = false;
+      connectInitiatedRef.current = false;
+
+      // Disconnect room if connected
+      if (roomRef.current) {
+        const room = roomRef.current;
+        if (room.state === 'connected' || room.state === 'connecting') {
+          console.log('Disconnecting room on VoiceAgent unmount');
+          room.disconnect().catch((err) => {
+            console.warn('Error disconnecting room during unmount:', err);
+          });
+        }
+        roomRef.current = null;
+      }
+    };
+  }, []);
 
   const connectWithRetry = useCallback(
     async (attempt = 1) => {
@@ -599,6 +676,8 @@ export default function VoiceAgent() {
         isConnectingRef.current = false; // Reset connecting flag
         connectionAttemptedRef.current = false; // Reset connection attempt flag
         connectInitiatedRef.current = false; // Reset so we can reconnect
+        roomRef.current = null; // Clear room reference
+
         // Optional: Auto-reconnect (skip if user initiated disconnect)
         if (reason !== DisconnectReason.CLIENT_INITIATED && userInteracted) {
           setConnectionState('connecting');
@@ -622,6 +701,9 @@ export default function VoiceAgent() {
         setConnectionState={setConnectionState}
         setConnectionStatus={setConnectionStatus}
         setAgentReady={setAgentReady}
+        onRoomReady={(room) => {
+          roomRef.current = room;
+        }}
       />
       <RoomAudioRenderer />
     </LiveKitRoom>
