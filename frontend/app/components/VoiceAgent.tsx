@@ -130,10 +130,14 @@ function VoiceInterface({
       room.off(RoomEvent.Disconnected, handleDisconnected);
 
       // Disconnect room on component unmount to prevent stale connections
-      if (room.state === 'connected' || room.state === 'connecting') {
-        console.log('Cleaning up room connection on unmount');
+      // Check state to avoid disconnecting an already disconnected/disconnecting room
+      if (room && (room.state === 'connected' || room.state === 'connecting')) {
+        console.log('VoiceInterface: Cleaning up room connection on unmount');
         room.disconnect().catch((err) => {
-          console.warn('Error disconnecting room during cleanup:', err);
+          // Ignore "already disconnected" errors
+          if (err.message && !err.message.includes('already')) {
+            console.warn('Error disconnecting room during cleanup:', err);
+          }
         });
       }
     };
@@ -417,6 +421,7 @@ export default function VoiceAgent() {
   const connectionAttemptedRef = useRef(false);
   const connectInitiatedRef = useRef(false);
   const roomRef = useRef<Room | null>(null);
+  const hasRenderedLiveKitRef = useRef(false); // Track if this component instance has rendered LiveKitRoom
 
   // Stable shouldConnect value using useMemo to prevent unnecessary re-renders
   // Based on LiveKit docs: once connect={true}, keep it true to maintain connection
@@ -490,10 +495,10 @@ export default function VoiceAgent() {
       // Remove beforeunload listener
       window.removeEventListener('beforeunload', handleBeforeUnload);
 
-      // Use a small delay before clearing everything to handle React Strict Mode
+      // Use a very small delay before clearing everything to handle React Strict Mode
       // If the component remounts within this window, the cleanup is cancelled
       const cleanupTimeout = setTimeout(() => {
-        console.log('Executing delayed cleanup');
+        console.log('Executing delayed cleanup after unmount');
 
         // Reset all connection tracking refs
         hasConnectedRef.current = false;
@@ -512,14 +517,17 @@ export default function VoiceAgent() {
         if (roomRef.current) {
           const room = roomRef.current;
           if (room.state === 'connected' || room.state === 'connecting') {
-            console.log('Disconnecting room on VoiceAgent unmount');
+            console.log('VoiceAgent: Disconnecting room on delayed cleanup');
             room.disconnect().catch((err) => {
-              console.warn('Error disconnecting room during unmount:', err);
+              // Ignore "already disconnected" errors
+              if (!err.message || !err.message.includes('already')) {
+                console.warn('Error disconnecting room during unmount:', err);
+              }
             });
           }
           roomRef.current = null;
         }
-      }, 50); // Reduced delay - just enough for Strict Mode
+      }, 10); // Very small delay - just enough for Strict Mode double-mount
 
       // If component remounts before timeout, cancel cleanup
       return () => clearTimeout(cleanupTimeout);
@@ -682,23 +690,15 @@ export default function VoiceAgent() {
     return null;
   }
 
-  // Prevent duplicate LiveKitRoom renders during Strict Mode double-mounting
-  // Use timestamp to detect if another render just happened (within 100ms)
-  const now = Date.now();
-  const timeSinceLastAttempt = now - lastConnectionAttemptTime;
-  const isDuplicateRender = timeSinceLastAttempt < DUPLICATE_THRESHOLD_MS;
+  // Track that we're rendering LiveKitRoom for logging purposes
+  // In Strict Mode, each component instance (mount) should render its own LiveKitRoom
+  // The cleanup from the first mount will disconnect that room
+  if (shouldConnect && !hasRenderedLiveKitRef.current) {
+    console.log('Rendering LiveKitRoom for this component instance');
+    hasRenderedLiveKitRef.current = true;
 
-  if (isDuplicateRender && shouldConnect) {
-    console.log(`Skipping duplicate render (${timeSinceLastAttempt}ms since last attempt)`);
-    // Return null to avoid rendering duplicate LiveKitRoom
-    // The first render's LiveKitRoom will handle the connection
-    return null;
-  }
-
-  // Update the timestamp and flag NOW before rendering LiveKitRoom
-  if (shouldConnect) {
-    console.log('Setting global connection flag and timestamp before LiveKitRoom render');
-    lastConnectionAttemptTime = now;
+    // Update global tracking
+    lastConnectionAttemptTime = Date.now();
     globalConnectionActive = true;
     if (typeof window !== 'undefined') {
       sessionStorage.setItem(STORAGE_KEY, 'true');
