@@ -457,12 +457,35 @@ export default function VoiceAgent() {
   useEffect(() => {
     if (!shouldConnect) return;
 
+    // Check for recent connection attempts from previous page load
+    const lastAttemptTimestamp = typeof window !== 'undefined'
+      ? parseInt(sessionStorage.getItem('livekit_last_attempt') || '0')
+      : 0;
+    const now = Date.now();
+    const timeSinceLastAttempt = now - lastAttemptTimestamp;
+
+    // If there was a recent attempt (< 3 seconds), wait before connecting
+    // This gives the server time to fully close the previous connection
+    if (timeSinceLastAttempt < 3000 && lastAttemptTimestamp > 0) {
+      const waitTime = 3000 - timeSinceLastAttempt;
+      console.log(`[${componentId}] Recent connection detected (${timeSinceLastAttempt}ms ago), waiting ${waitTime}ms for server cleanup`);
+      const waitTimer = setTimeout(() => {
+        console.log(`[${componentId}] Wait complete, checking ownership`);
+        // Re-trigger the effect by updating canRender state
+        setCanRender(currentMountId === null || currentMountId === componentId);
+      }, waitTime);
+      return () => clearTimeout(waitTimer);
+    }
+
     // Try to claim ownership
     if (currentMountId === null || currentMountId === componentId) {
       // We can render
       if (!canRender) {
         console.log(`[${componentId}] Can render LiveKitRoom`);
         setCanRender(true);
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem('livekit_last_attempt', now.toString());
+        }
       }
     } else {
       // Another component owns it, wait for ownership to become available
@@ -471,6 +494,9 @@ export default function VoiceAgent() {
         if (currentMountId === null || currentMountId === componentId) {
           console.log(`[${componentId}] Ownership available, claiming it`);
           setCanRender(true);
+          if (typeof window !== 'undefined') {
+            sessionStorage.setItem('livekit_last_attempt', Date.now().toString());
+          }
           clearInterval(checkInterval);
         }
       }, 5); // Check every 5ms
@@ -485,10 +511,14 @@ export default function VoiceAgent() {
     // If a stale connection exists, it means the page was reloaded while connected
     if (typeof window !== 'undefined') {
       const staleConnection = sessionStorage.getItem(STORAGE_KEY);
-      if (staleConnection) {
+      const staleTimestamp = sessionStorage.getItem('livekit_last_attempt');
+
+      if (staleConnection || staleTimestamp) {
         console.log('Detected page reload with active connection - clearing stale flags');
         sessionStorage.removeItem(STORAGE_KEY);
+        sessionStorage.removeItem('livekit_last_attempt');
         globalConnectionActive = false;
+        currentMountId = null;
       }
     }
 
@@ -499,8 +529,10 @@ export default function VoiceAgent() {
       // Clear connection flags and timestamps immediately
       globalConnectionActive = false;
       lastConnectionAttemptTime = 0;
+      currentMountId = null;
       if (typeof window !== 'undefined') {
         sessionStorage.removeItem(STORAGE_KEY);
+        sessionStorage.removeItem('livekit_last_attempt');
       }
 
       if (roomRef.current) {
@@ -544,6 +576,7 @@ export default function VoiceAgent() {
           currentMountId = null;
           if (typeof window !== 'undefined') {
             sessionStorage.removeItem(STORAGE_KEY);
+            sessionStorage.removeItem('livekit_last_attempt');
           }
 
           // Disconnect room if connected
@@ -796,8 +829,10 @@ export default function VoiceAgent() {
         // Clear global connection flags and timestamps
         globalConnectionActive = false;
         lastConnectionAttemptTime = 0;
+        currentMountId = null;
         if (typeof window !== 'undefined') {
           sessionStorage.removeItem(STORAGE_KEY);
+          sessionStorage.removeItem('livekit_last_attempt');
         }
 
         // Optional: Auto-reconnect (skip if user initiated disconnect)
